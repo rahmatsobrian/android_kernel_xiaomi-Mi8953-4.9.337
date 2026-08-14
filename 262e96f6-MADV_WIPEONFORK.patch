@@ -1,0 +1,266 @@
+From 262e96f69728b5589a99ba2d66e50c5df8af5330 Mon Sep 17 00:00:00 2001
+From: Rik van Riel <riel@redhat.com>
+Date: Wed, 6 Sep 2017 16:25:15 -0700
+Subject: [PATCH] UPSTREAM: mm,fork: introduce MADV_WIPEONFORK
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Introduce MADV_WIPEONFORK semantics, which result in a VMA being empty
+in the child process after fork.  This differs from MADV_DONTFORK in one
+important way.
+
+If a child process accesses memory that was MADV_WIPEONFORK, it will get
+zeroes.  The address ranges are still valid, they are just empty.
+
+If a child process accesses memory that was MADV_DONTFORK, it will get a
+segmentation fault, since those address ranges are no longer valid in
+the child after fork.
+
+Since MADV_DONTFORK also seems to be used to allow very large programs
+to fork in systems with strict memory overcommit restrictions, changing
+the semantics of MADV_DONTFORK might break existing programs.
+
+MADV_WIPEONFORK only works on private, anonymous VMAs.
+
+The use case is libraries that store or cache information, and want to
+know that they need to regenerate it in the child process after fork.
+
+Examples of this would be:
+ - systemd/pulseaudio API checks (fail after fork) (replacing a getpid
+   check, which is too slow without a PID cache)
+ - PKCS#11 API reinitialization check (mandated by specification)
+ - glibc's upcoming PRNG (reseed after fork)
+ - OpenSSL PRNG (reseed after fork)
+
+The security benefits of a forking server having a re-inialized PRNG in
+every child process are pretty obvious.  However, due to libraries
+having all kinds of internal state, and programs getting compiled with
+many different versions of each library, it is unreasonable to expect
+calling programs to re-initialize everything manually after fork.
+
+A further complication is the proliferation of clone flags, programs
+bypassing glibc's functions to call clone directly, and programs calling
+unshare, causing the glibc pthread_atfork hook to not get called.
+
+It would be better to have the kernel take care of this automatically.
+
+The patch also adds MADV_KEEPONFORK, to undo the effects of a prior
+MADV_WIPEONFORK.
+
+This is similar to the OpenBSD minherit syscall with MAP_INHERIT_ZERO:
+
+    https://man.openbsd.org/minherit.2
+
+[akpm@linux-foundation.org: numerically order arch/parisc/include/uapi/asm/mman.h #defines]
+Link: http://lkml.kernel.org/r/20170811212829.29186-3-riel@redhat.com
+Signed-off-by: Rik van Riel <riel@redhat.com>
+Reported-by: Florian Weimer <fweimer@redhat.com>
+Reported-by: Colm MacCártaigh <colm@allcosts.net>
+Reviewed-by: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+Cc: Andy Lutomirski <luto@amacapital.net>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Ingo Molnar <mingo@kernel.org>
+Cc: Helge Deller <deller@gmx.de>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Will Drewry <wad@chromium.org>
+Cc: <linux-api@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+ arch/alpha/include/uapi/asm/mman.h     |  3 +++
+ arch/mips/include/uapi/asm/mman.h      |  3 +++
+ arch/parisc/include/uapi/asm/mman.h    |  3 +++
+ arch/xtensa/include/uapi/asm/mman.h    |  3 +++
+ fs/proc/task_mmu.c                     |  1 +
+ include/linux/mm.h                     |  2 +-
+ include/trace/events/mmflags.h         |  8 +-------
+ include/uapi/asm-generic/mman-common.h |  3 +++
+ kernel/fork.c                          | 10 ++++++++--
+ mm/madvise.c                           | 13 +++++++++++++
+ 10 files changed, 39 insertions(+), 10 deletions(-)
+
+diff --git arch/alpha/include/uapi/asm/mman.h arch/alpha/include/uapi/asm/mman.h
+index 02760f6e6ca4..2a708a792882 100644
+--- arch/alpha/include/uapi/asm/mman.h
++++ arch/alpha/include/uapi/asm/mman.h
+@@ -64,6 +64,9 @@
+ 					   overrides the coredump filter bits */
+ #define MADV_DODUMP	17		/* Clear the MADV_NODUMP flag */
+ 
++#define MADV_WIPEONFORK 18		/* Zero memory on fork, child only */
++#define MADV_KEEPONFORK 19		/* Undo MADV_WIPEONFORK */
++
+ /* compatibility flags */
+ #define MAP_FILE	0
+ 
+diff --git arch/mips/include/uapi/asm/mman.h arch/mips/include/uapi/asm/mman.h
+index 655e2fb5395b..d59c57d60d7d 100644
+--- arch/mips/include/uapi/asm/mman.h
++++ arch/mips/include/uapi/asm/mman.h
+@@ -91,6 +91,9 @@
+ 					   overrides the coredump filter bits */
+ #define MADV_DODUMP	17		/* Clear the MADV_NODUMP flag */
+ 
++#define MADV_WIPEONFORK 18		/* Zero memory on fork, child only */
++#define MADV_KEEPONFORK 19		/* Undo MADV_WIPEONFORK */
++
+ /* compatibility flags */
+ #define MAP_FILE	0
+ 
+diff --git arch/parisc/include/uapi/asm/mman.h arch/parisc/include/uapi/asm/mman.h
+index 5979745815a5..e205e0179642 100644
+--- arch/parisc/include/uapi/asm/mman.h
++++ arch/parisc/include/uapi/asm/mman.h
+@@ -60,6 +60,9 @@
+ 					   overrides the coredump filter bits */
+ #define MADV_DODUMP	70		/* Clear the MADV_NODUMP flag */
+ 
++#define MADV_WIPEONFORK 71		/* Zero memory on fork, child only */
++#define MADV_KEEPONFORK 72		/* Undo MADV_WIPEONFORK */
++
+ /* compatibility flags */
+ #define MAP_FILE	0
+ #define MAP_VARIABLE	0
+diff --git arch/xtensa/include/uapi/asm/mman.h arch/xtensa/include/uapi/asm/mman.h
+index 24365b30aae9..ed23e0a1b30d 100644
+--- arch/xtensa/include/uapi/asm/mman.h
++++ arch/xtensa/include/uapi/asm/mman.h
+@@ -103,6 +103,9 @@
+ 					   overrides the coredump filter bits */
+ #define MADV_DODUMP	17		/* Clear the MADV_NODUMP flag */
+ 
++#define MADV_WIPEONFORK 18		/* Zero memory on fork, child only */
++#define MADV_KEEPONFORK 19		/* Undo MADV_WIPEONFORK */
++
+ /* compatibility flags */
+ #define MAP_FILE	0
+ 
+diff --git fs/proc/task_mmu.c fs/proc/task_mmu.c
+index 8aca01acd807..50eff2b162a2 100644
+--- fs/proc/task_mmu.c
++++ fs/proc/task_mmu.c
+@@ -726,6 +726,7 @@ static void show_smap_vma_flags(struct seq_file *m, struct vm_area_struct *vma)
+ 		[ilog2(VM_NORESERVE)]	= "nr",
+ 		[ilog2(VM_HUGETLB)]	= "ht",
+ 		[ilog2(VM_ARCH_1)]	= "ar",
++		[ilog2(VM_WIPEONFORK)]	= "wf",
+ 		[ilog2(VM_DONTDUMP)]	= "dd",
+ #ifdef CONFIG_MEM_SOFT_DIRTY
+ 		[ilog2(VM_SOFTDIRTY)]	= "sd",
+diff --git include/linux/mm.h include/linux/mm.h
+index e3d72b77dd46..4499fc9f69fe 100644
+--- include/linux/mm.h
++++ include/linux/mm.h
+@@ -187,7 +187,7 @@ extern unsigned int kobjsize(const void *objp);
+ #define VM_NORESERVE	0x00200000	/* should the VM suppress accounting */
+ #define VM_HUGETLB	0x00400000	/* Huge TLB Page VM */
+ #define VM_ARCH_1	0x01000000	/* Architecture-specific flag */
+-#define VM_ARCH_2	0x02000000
++#define VM_WIPEONFORK	0x02000000	/* Wipe VMA contents in child. */
+ #define VM_DONTDUMP	0x04000000	/* Do not include in the core dump */
+ 
+ #ifdef CONFIG_MEM_SOFT_DIRTY
+diff --git include/trace/events/mmflags.h include/trace/events/mmflags.h
+index 61d41f2543ac..62d0d9b7521a 100644
+--- include/trace/events/mmflags.h
++++ include/trace/events/mmflags.h
+@@ -125,12 +125,6 @@ IF_HAVE_PG_IDLE(PG_idle,		"idle"		)
+ #define __VM_ARCH_SPECIFIC_1 {VM_ARCH_1,	"arch_1"	}
+ #endif
+ 
+-#if defined(CONFIG_X86)
+-#define __VM_ARCH_SPECIFIC_2 {VM_MPX,		"mpx"		}
+-#else
+-#define __VM_ARCH_SPECIFIC_2 {VM_ARCH_2,	"arch_2"	}
+-#endif
+-
+ #ifdef CONFIG_MEM_SOFT_DIRTY
+ #define IF_HAVE_VM_SOFTDIRTY(flag,name) {flag, name },
+ #else
+@@ -162,7 +156,7 @@ IF_HAVE_PG_IDLE(PG_idle,		"idle"		)
+ 	{VM_NORESERVE,			"noreserve"	},		\
+ 	{VM_HUGETLB,			"hugetlb"	},		\
+ 	__VM_ARCH_SPECIFIC_1				,		\
+-	__VM_ARCH_SPECIFIC_2				,		\
++	{VM_WIPEONFORK,			"wipeonfork"	},		\
+ 	{VM_DONTDUMP,			"dontdump"	},		\
+ IF_HAVE_VM_SOFTDIRTY(VM_SOFTDIRTY,	"softdirty"	)		\
+ 	{VM_MIXEDMAP,			"mixedmap"	},		\
+diff --git include/uapi/asm-generic/mman-common.h include/uapi/asm-generic/mman-common.h
+index 8c27db0c5c08..49e2b1d78093 100644
+--- include/uapi/asm-generic/mman-common.h
++++ include/uapi/asm-generic/mman-common.h
+@@ -58,6 +58,9 @@
+ 					   overrides the coredump filter bits */
+ #define MADV_DODUMP	17		/* Clear the MADV_DONTDUMP flag */
+ 
++#define MADV_WIPEONFORK 18		/* Zero memory on fork, child only */
++#define MADV_KEEPONFORK 19		/* Undo MADV_WIPEONFORK */
++
+ /* compatibility flags */
+ #define MAP_FILE	0
+ 
+diff --git kernel/fork.c kernel/fork.c
+index 35194e5a4d55..be78f350d9e2 100644
+--- kernel/fork.c
++++ kernel/fork.c
+@@ -627,7 +627,12 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
+ 		if (retval)
+ 			goto fail_nomem_policy;
+ 		tmp->vm_mm = mm;
+-		if (anon_vma_fork(tmp, mpnt))
++		if (tmp->vm_flags & VM_WIPEONFORK) {
++			/* VM_WIPEONFORK gets a clean slate in the child. */
++			tmp->anon_vma = NULL;
++			if (anon_vma_prepare(tmp))
++				goto fail_nomem_anon_vma_fork;
++		} else if (anon_vma_fork(tmp, mpnt))
+ 			goto fail_nomem_anon_vma_fork;
+ 		tmp->vm_flags &=
+ 			~(VM_LOCKED|VM_LOCKONFAULT|VM_UFFD_MISSING|VM_UFFD_WP);
+@@ -673,7 +678,8 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
+ 		rb_parent = &tmp->vm_rb;
+ 
+ 		mm->map_count++;
+-		retval = copy_page_range(mm, oldmm, mpnt);
++		if (!(tmp->vm_flags & VM_WIPEONFORK))
++			retval = copy_page_range(mm, oldmm, mpnt);
+ 
+ 		if (tmp->vm_ops && tmp->vm_ops->open)
+ 			tmp->vm_ops->open(tmp);
+diff --git mm/madvise.c mm/madvise.c
+index b753f0265384..c578113904d7 100644
+--- mm/madvise.c
++++ mm/madvise.c
+@@ -79,6 +79,17 @@ static long madvise_behavior(struct vm_area_struct *vma,
+ 		}
+ 		new_flags &= ~VM_DONTCOPY;
+ 		break;
++	case MADV_WIPEONFORK:
++		/* MADV_WIPEONFORK is only supported on anonymous memory. */
++		if (vma->vm_file || vma->vm_flags & VM_SHARED) {
++			error = -EINVAL;
++			goto out;
++		}
++		new_flags |= VM_WIPEONFORK;
++		break;
++	case MADV_KEEPONFORK:
++		new_flags &= ~VM_WIPEONFORK;
++		break;
+ 	case MADV_DONTDUMP:
+ 		new_flags |= VM_DONTDUMP;
+ 		break;
+@@ -623,6 +634,8 @@ madvise_behavior_valid(int behavior)
+ #endif
+ 	case MADV_DONTDUMP:
+ 	case MADV_DODUMP:
++	case MADV_WIPEONFORK:
++	case MADV_KEEPONFORK:
+ 		return true;
+ 
+ 	default:
