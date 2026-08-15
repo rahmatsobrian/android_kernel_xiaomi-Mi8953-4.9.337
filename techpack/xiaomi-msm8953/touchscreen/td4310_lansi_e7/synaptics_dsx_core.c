@@ -79,11 +79,11 @@
 #define F12_DATA_15_WORKAROUND
 
 #define IGNORE_FN_INIT_FAILURE
-/*
+
 #define FB_READY_RESET
 #define FB_READY_WAIT_MS 100
-#define FB_READY_TIMEOUT_S 30
-*/
+#define FB_READY_TIMEOUT_S 5    // cukup 5 detik buat kasus TWRP
+
 #ifdef SYNA_TDDI
 #define TDDI_LPWG_WAIT_US 100
 #endif
@@ -4115,9 +4115,9 @@ static void synaptics_rmi4_reset_work (struct work_struct *work)
 		timeout--;
 		if (timeout == 0) {
 			dev_err (rmi4_data->pdev->dev.parent,
-					"%s: Timed out waiting for FB ready\n",
+					"%s: Timed out waiting for FB ready, forcing reset anyway\n",
 					__func__);
-			goto err;
+			break;   // <-- lanjut ke reset_device di bawah, bukan skip total
 		}
 	}
 
