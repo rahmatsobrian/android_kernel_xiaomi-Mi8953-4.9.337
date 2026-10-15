@@ -21,6 +21,7 @@ OUTDIR="$ROOTDIR/out/arch/arm64/boot"
 ANYKERNEL_DIR="$ROOTDIR/AnyKernel"
 KIMG_DTB="$OUTDIR/Image.gz-dtb"
 KIMG="$OUTDIR/Image.gz"
+KSU_DIR="KernelSU" # Folder default KernelSU setelah setup.sh
 
 # ========== TOOLCHAIN (CLANG) ===========
 export PATH="$ROOTDIR/clang-zyc/bin:$PATH"
@@ -45,8 +46,10 @@ export TELE_SESSION="${TELE_SESSION}"
 # ================= GLOBAL =================
 BUILD_TIME="unknown"
 KERNEL_VERSION="unknown"
+KSU_VERSION="unknown"
 IMG_USED="unknown"
 ZIP_NAME=""
+MSG_ID=""
 
 # ================= FUNCTION =================
 clone_anykernel() {
@@ -67,22 +70,66 @@ get_kernel_version() {
     fi
 }
 
-send_telegram_error() {
-    curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-        -d chat_id="${TG_CHAT_ID}" \
-        -d parse_mode=Markdown \
-        -d text="❌ *Kernel CI Build Test Failed [${VARIANT}]*
-
-📄 *Log attached below*"
-
-    send_telegram_log
+get_ksu_version() {
+    if [ "$VARIANT" == "KSU" ]; then
+        if [ -f "$KSU_DIR/kernel/Makefile" ]; then
+            # Mencari baris yang mengandung 'CFLAGS_ksu.o += -DKSU_VERSION=' atau mirip
+            # dan mengambil angkanya saja.
+            KSU_VERSION=$(grep -E 'KSU_VERSION=' "$KSU_DIR/kernel/Makefile" | awk -F'KSU_VERSION=' '{print $2}')
+            
+            # Membersihkan string jika ada whitespace atau karakter sisa
+            KSU_VERSION=$(echo "$KSU_VERSION" | tr -d ' ' | tr -d '\n')
+            
+            if [ -z "$KSU_VERSION" ]; then
+                 KSU_VERSION="Unknown"
+            else
+                 KSU_VERSION="v${KSU_VERSION}"
+            fi
+        else
+            KSU_VERSION="Unknown (Makefile not found)"
+        fi
+    else
+        KSU_VERSION="None (NonKSU)"
+    fi
 }
 
+# Kirim pesan awal dan ambil message_id
 send_telegram_start() {
-    curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+    RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
         -d chat_id="${TG_CHAT_ID}" \
         -d parse_mode=Markdown \
-        -d text="🚀 *Kernel CI Build Test Started [${VARIANT}]*"
+        -d disable_web_page_preview=true \
+        -d text="🚀 *Kernel CI Build Started [${VARIANT}]*
+
+📱 *Device* : ${DEVICE}
+📦 *Kernel Name* : ${KERNEL_NAME}
+⏳ *Status* : Preparing build environment...")
+
+    MSG_ID=$(echo "$RESPONSE" | jq -r '.result.message_id // empty')
+}
+
+# Update teks pesan yang sudah ada
+update_status() {
+    local text="$1"
+    [ -z "$MSG_ID" ] && return
+    curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/editMessageText" \
+        -d chat_id="${TG_CHAT_ID}" \
+        -d message_id="${MSG_ID}" \
+        -d parse_mode=Markdown \
+        -d disable_web_page_preview=true \
+        -d text="$text" > /dev/null
+}
+
+send_telegram_error() {
+    update_status "❌ *Kernel CI Build Failed [${VARIANT}]*
+
+📱 *Device* : ${DEVICE}
+📦 *Kernel Name* : ${KERNEL_NAME}
+⚠️ *Status* : Build terminated with error.
+
+📄 *Log file attached below*"
+
+    send_telegram_log
 }
 
 send_telegram_log() {
@@ -90,13 +137,16 @@ send_telegram_log() {
     [ ! -f "$LOG_FILE" ] && return
     curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
         -F chat_id="${TG_CHAT_ID}" \
-        -F document=@"${LOG_FILE}"
+        -F document=@"${LOG_FILE}" > /dev/null
 }
 
 # ================= Build Kernel =================
 build_kernel() {
     echo -e "$yellow[+] Sending telegram start...$white"
     send_telegram_start
+
+    echo -e "$yellow[+] Getting KSU version...$white"
+    get_ksu_version
 
     echo -e "$yellow[+] Removing out folder...$white"
     rm -rf out
@@ -106,6 +156,7 @@ build_kernel() {
 
     # === DYNAMIC DEFCONFIG SETUP ===
     echo -e "$yellow[+] Preparing kernel config for ${VARIANT}...$white"
+    update_status "⚙️ *Preparing Kernel Config [${VARIANT}]*..."
     cp arch/arm64/configs/${DEFCONFIG} arch/arm64/configs/${TEMP_DEFCONFIG}
 
     if [ "$VARIANT" == "NonKSU" ]; then
@@ -113,25 +164,52 @@ build_kernel() {
         sed -i 's/CONFIG_KSU=y/# CONFIG_KSU is not set/g' arch/arm64/configs/${TEMP_DEFCONFIG}
     fi
 
-# Setting config
-echo -e "$yellow[+] Preparing kernel config...$white"
-make O=out ARCH=arm64 ${TEMP_DEFCONFIG} ${FRAGMENT} || {
-    send_telegram_error
-    exit 1
-}
+    # Setting config
+    echo -e "$yellow[+] Preparing kernel config...$white"
+    make O=out ARCH=arm64 ${TEMP_DEFCONFIG} ${FRAGMENT} || {
+        send_telegram_error
+        exit 1
+    }
 
     BUILD_START=$(TZ=Asia/Jakarta date +%s)
 
     echo -e "$yellow[+] Building Kernel [${VARIANT}]...$white"
+    
+    # Background process buat update progress & timer tiap 10 detik ke Telegram
+    (
+        while true; do
+            sleep 10
+            NOW=$(TZ=Asia/Jakarta date +%s)
+            DIFF=$((NOW - BUILD_START))
+            MIN=$((DIFF / 60))
+            SEC=$((DIFF % 60))
+            update_status "🛠️ *Building Kernel [${VARIANT}]*
+
+📱 *Device* : ${DEVICE}
+⚙️ *Compiler* : ZyC Clang
+🦸 *KSU Version* : ${KSU_VERSION}
+⏳ *Status* : Compiling kernel source...
+⏱️ *Elapsed Time* : ${MIN}m ${SEC}s"
+        done
+    ) &
+    UPDATER_PID=$!
+
     make -j$(nproc --all) \
-  ARCH=arm64 \
-  O=out \
-  CC=clang \
-  CROSS_COMPILE=aarch64-linux-gnu- \
-  CROSS_COMPILE_ARM32=arm-linux-gnueabi- || {
-            send_telegram_error
-            exit 1
-        }
+      ARCH=arm64 \
+      O=out \
+      CC=clang \
+      CROSS_COMPILE=aarch64-linux-gnu- \
+      CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+    MAKE_EXIT_CODE=$?
+
+    # Stop background updater
+    kill $UPDATER_PID 2>/dev/null
+    wait $UPDATER_PID 2>/dev/null
+
+    if [ $MAKE_EXIT_CODE -ne 0 ]; then
+        send_telegram_error
+        exit 1
+    fi
 
     BUILD_END=$(TZ=Asia/Jakarta date +%s)
     DIFF=$((BUILD_END - BUILD_START))
@@ -146,6 +224,7 @@ make O=out ARCH=arm64 ${TEMP_DEFCONFIG} ${FRAGMENT} || {
 # =============== Zipping Kernel ===============
 pack_kernel() {
     echo -e "$yellow[+] Packing AnyKernel...$white"
+    update_status "📦 *Packing AnyKernel3 [${VARIANT}]*..."
 
     clone_anykernel
     cd "$ANYKERNEL_DIR" || exit 1
@@ -174,6 +253,8 @@ upload_telegram() {
     ZIP_PATH="$ANYKERNEL_DIR/$ZIP_NAME"
     [ ! -f "$ZIP_PATH" ] && return
 
+    update_status "☁️ *Uploading to Pixeldrain & Safelinku [${VARIANT}]*..."
+
     # ===== Upload to Pixeldrain =====
     echo -e "$yellow[+] Uploading to Pixeldrain...$white"
     PD_RESPONSE=$(curl -s -T "${ZIP_PATH}" -u :${PIXELDRAIN_API_KEY} "https://pixeldrain.com/api/file/${ZIP_NAME}")
@@ -190,13 +271,11 @@ upload_telegram() {
     # ===== Generate Safelinku via Telegram Userbot =====
     echo -e "$yellow[+] Generating Safelinku via Telegram Userbot...$white"
 
-    # Jalankan Python Telethon langsung di dalam Bash
     SL_LINK=$(python3 << 'EOF'
 import asyncio, os, re, logging
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
-# Sembunyikan warning telethon agar output bersih
 logging.basicConfig(level=logging.ERROR)
 
 api_id = os.environ.get("TELE_API_ID", "")
@@ -223,7 +302,6 @@ async def main():
     @client.on(events.NewMessage(chats=bot_username))
     async def handler(event):
         text = event.message.message
-        # Cek apakah bot membalas dengan link sfl.gl atau safelinku
         if "http" in text:
             urls = re.findall(r'(https?://[^\s]+)', text)
             if urls:
@@ -231,11 +309,9 @@ async def main():
             else:
                 future.set_result("Generation Failed (Bot replied without URL)")
     
-    # Minta bot untuk membuat shortlink
     await client.send_message(bot_username, f"/shortlink {pd_link}")
     
     try:
-        # Tunggu balasan dari bot maksimal 15 detik
         res = await asyncio.wait_for(future, timeout=15.0)
     except asyncio.TimeoutError:
         res = "Generation Failed (Bot Timeout)"
@@ -247,7 +323,6 @@ asyncio.run(main())
 EOF
 )
 
-    # Validasi URL yang dikembalikan dari Python
     if [[ "$SL_LINK" == http* ]]; then
         echo -e "$green[✓] Safelinku Link: $SL_LINK$white"
     else
@@ -255,8 +330,8 @@ EOF
         SL_LINK="Generation Failed"
     fi
 
-    # ===== Send to Telegram =====
-    echo -e "$yellow[+] Sending message to Telegram...$white"
+    # ===== Send Final Status to Telegram =====
+    echo -e "$yellow[+] Updating Telegram final message...$white"
 
     if [ "$SL_LINK" != "Generation Failed" ]; then
         DOWNLOAD_TEXT="📥 *Download Links*:
@@ -268,21 +343,24 @@ EOF
 ⚠️ Safelinku: Generation Failed"
     fi
 
-    curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
-        -F chat_id="${TG_CHAT_ID}" \
-        -F document=@"${ZIP_PATH}" \
-        -F parse_mode="Markdown" \
-        -F caption="🔥 *Kernel CI Build Test Success*
+    update_status "🔥 *Kernel CI Build Test Success*
 
 📱 *Device* : ${DEVICE}
 📦 *Kernel Name* : ${KERNEL_NAME}
 🏷️ *Variant* : ${VARIANT}
 🍃 *Kernel Version* : ${KERNEL_VERSION}
+🦸 *KSU Version* : ${KSU_VERSION}
 
 ⌛ *Build Time* : ${BUILD_TIME}
 🕒 *Build Date* : ${BUILD_DATETIME}
 
 ${DOWNLOAD_TEXT}"
+
+    # Kirim file zip (tanpa menumpuk pesan teks ringkasan)
+    curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
+        -F chat_id="${TG_CHAT_ID}" \
+        -F document=@"${ZIP_PATH}" \
+        -F caption="📦 ${ZIP_NAME}" > /dev/null
 
     send_telegram_log
 }
