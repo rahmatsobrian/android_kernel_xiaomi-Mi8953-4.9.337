@@ -9,12 +9,7 @@ white='\033[0m'
 # ================= PATH =================
 DEFCONFIG="msm8953-perf_defconfig"
 FRAGMENT="mi8953.config"
-TEMP_DEFCONFIG="msm8953-perf_temp_defconfig"
 ROOTDIR=$(pwd)
-OUTDIR="$ROOTDIR/out/arch/arm64/boot"
-ANYKERNEL_DIR="$ROOTDIR/AnyKernel"
-KIMG_DTB="$OUTDIR/Image.gz-dtb"
-KIMG="$OUTDIR/Image.gz"
 KSU_DIR="KernelSU"
 
 # ========== TOOLCHAIN (CLANG) ===========
@@ -37,27 +32,21 @@ export TELE_API_ID="${TELE_API_ID}"
 export TELE_API_HASH="${TELE_API_HASH}"
 export TELE_SESSION="${TELE_SESSION}"
 
-# ================= GLOBAL STATE =================
+# ================= IPC / STATUS DIRECTORY =================
+STATUS_DIR="/tmp/yoru_build_status"
+rm -rf "$STATUS_DIR"
+mkdir -p "$STATUS_DIR"
+mkdir -p "$ROOTDIR/logs"
+
 MSG_ID=""
+KERNEL_VERSION="unknown"
 KSU_VERSION="unknown"
 
-STATUS_KSU="⏳ Pending"
-STATUS_NONKSU="⏳ Pending"
-
-TIME_KSU="-"
-TIME_NONKSU="-"
-
-DL_TEXT_KSU="Pending"
-DL_TEXT_NONKSU="Pending"
+# Initial State
+echo "pending" > "$STATUS_DIR/state_KSU"
+echo "pending" > "$STATUS_DIR/state_NonKSU"
 
 # ================= FUNCTION =================
-clone_anykernel() {
-    if [ ! -d "$ANYKERNEL_DIR" ]; then
-        echo -e "$yellow[+] Cloning AnyKernel3...$white"
-        git clone -b ${DEVICE} https://github.com/rahmatsobrian/AnyKernel3.git "$ANYKERNEL_DIR" || exit 1
-    fi
-}
-
 get_kernel_version() {
     if [ -f "Makefile" ]; then
         VERSION=$(grep -E '^VERSION =' Makefile | awk '{print $3}')
@@ -88,15 +77,15 @@ send_telegram_start() {
         -d chat_id="${TG_CHAT_ID}" \
         -d parse_mode=Markdown \
         -d disable_web_page_preview=true \
-        -d text="🚀 *Kernel CI Build Started*
+        -d text="🚀 *Kernel CI Build Started (Parallel)*
 
 📱 *Device* : ${DEVICE}
 📦 *Kernel Name* : ${KERNEL_NAME}
 🍃 *Kernel Version* : ${KERNEL_VERSION}
 🦸 *KSU Version* : ${KSU_VERSION}
 
-⚙️ *KSU Variant* : ⏳ Pending
-⚙️ *NonKSU Variant* : ⏳ Pending")
+⚙️ *KSU Variant* : ⏳ Starting...
+⚙️ *NonKSU Variant* : ⏳ Starting...")
 
     MSG_ID=$(echo "$RESPONSE" | jq -r '.result.message_id // empty')
 }
@@ -112,140 +101,101 @@ update_status() {
         -d text="$text" > /dev/null
 }
 
-render_progress_message() {
-    echo "🛠️ *Building Yoru Kernel*
-
-📱 *Device* : ${DEVICE}
-⚙️ *Compiler* : ZyC Clang
-
-🦸 *KSU Variant* (${KSU_VERSION})
-Status : ${STATUS_KSU}
-
-🍃 *NonKSU Variant*
-Status : ${STATUS_NONKSU}"
+send_telegram_log() {
+    local variant="$1"
+    local LOG_FILE="$ROOTDIR/logs/build-${variant}.txt"
+    [ ! -f "$LOG_FILE" ] && return
+    curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
+        -F chat_id="${TG_CHAT_ID}" \
+        -F document=@"${LOG_FILE}" \
+        -F caption="📄 Build Log (${variant})" > /dev/null
 }
 
-send_telegram_error() {
-    local failed_variant="$1"
-    update_status "❌ *Kernel CI Build Failed*
-
-📱 *Device* : ${DEVICE}
-⚠️ *Failed Variant* : ${failed_variant}
-
-📄 *Log file attached below*"
-
-    LOG_FILE="$ROOTDIR/logs/build-${failed_variant}.txt"
-    if [ -f "$LOG_FILE" ]; then
-        curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
-            -F chat_id="${TG_CHAT_ID}" \
-            -F document=@"${LOG_FILE}" > /dev/null
-    fi
-}
-
-# ================= BUILD PROCESS FOR A VARIANT =================
+# ================= PARALLEL BUILD WORKER =================
 build_single_variant() {
-    VARIANT="$1"
-    echo -e "$yellow[+] Starting Build for ${VARIANT}...$white"
+    local VARIANT="$1"
+    local OUTDIR_VAR="$ROOTDIR/out_${VARIANT}"
+    local ANYKERNEL_VAR="$ROOTDIR/AnyKernel_${VARIANT}"
+    local TEMP_DEFCONFIG_VAR="msm8953_${VARIANT}_defconfig"
+    local LOG_FILE="$ROOTDIR/logs/build-${VARIANT}.txt"
 
-    rm -rf out
-    mkdir -p out
+    echo "compiling" > "$STATUS_DIR/state_${VARIANT}"
 
-    cp arch/arm64/configs/${DEFCONFIG} arch/arm64/configs/${TEMP_DEFCONFIG}
+    rm -rf "$OUTDIR_VAR"
+    mkdir -p "$OUTDIR_VAR"
+
+    cp arch/arm64/configs/${DEFCONFIG} arch/arm64/configs/${TEMP_DEFCONFIG_VAR}
 
     if [ "$VARIANT" == "NonKSU" ]; then
-        sed -i 's/CONFIG_KSU=y/# CONFIG_KSU is not set/g' arch/arm64/configs/${TEMP_DEFCONFIG}
+        sed -i 's/CONFIG_KSU=y/# CONFIG_KSU is not set/g' arch/arm64/configs/${TEMP_DEFCONFIG_VAR}
     fi
 
-    make O=out ARCH=arm64 ${TEMP_DEFCONFIG} ${FRAGMENT} > /dev/null 2>&1 || {
-        send_telegram_error "$VARIANT"
-        exit 1
-    }
+    # Config
+    make O="out_${VARIANT}" ARCH=arm64 "${TEMP_DEFCONFIG_VAR}" ${FRAGMENT} > "$LOG_FILE" 2>&1
+    if [ $? -ne 0 ]; then
+        echo "failed" > "$STATUS_DIR/state_${VARIANT}"
+        return 1
+    fi
 
-    BUILD_START=$(TZ=Asia/Jakarta date +%s)
-
-    # Loop update status real-time per 10 detik
-    (
-        while true; do
-            sleep 10
-            NOW=$(TZ=Asia/Jakarta date +%s)
-            DIFF=$((NOW - BUILD_START))
-            MIN=$((DIFF / 60))
-            SEC=$((DIFF % 60))
-            
-            if [ "$VARIANT" == "KSU" ]; then
-                STATUS_KSU="🛠️ Compiling... (⏱️ ${MIN}m ${SEC}s)"
-            else
-                STATUS_NONKSU="🛠️ Compiling... (⏱️ ${MIN}m ${SEC}s)"
-            fi
-            
-            update_status "$(render_progress_message)"
-        done
-    ) &
-    UPDATER_PID=$!
-
+    # Build Kernel
     make -j$(nproc --all) \
       ARCH=arm64 \
-      O=out \
+      O="out_${VARIANT}" \
       CC=clang \
       CROSS_COMPILE=aarch64-linux-gnu- \
-      CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-    MAKE_EXIT_CODE=$?
+      CROSS_COMPILE_ARM32=arm-linux-gnueabi- >> "$LOG_FILE" 2>&1
 
-    kill $UPDATER_PID 2>/dev/null
-    wait $UPDATER_PID 2>/dev/null
-
-    if [ $MAKE_EXIT_CODE -ne 0 ]; then
-        if [ "$VARIANT" == "KSU" ]; then STATUS_KSU="❌ Build Failed"; else STATUS_NONKSU="❌ Build Failed"; fi
-        send_telegram_error "$VARIANT"
-        exit 1
+    if [ $? -ne 0 ]; then
+        echo "failed" > "$STATUS_DIR/state_${VARIANT}"
+        return 1
     fi
 
-    BUILD_END=$(TZ=Asia/Jakarta date +%s)
-    DIFF=$((BUILD_END - BUILD_START))
-    BUILD_TIME="$((DIFF / 60)) min $((DIFF % 60)) sec"
+    local BUILD_END=$(TZ=Asia/Jakarta date +%s)
+    local START_VAR=$(cat "$STATUS_DIR/start_${VARIANT}")
+    local DIFF=$((BUILD_END - START_VAR))
+    local B_TIME="$((DIFF / 60)) min $((DIFF % 60)) sec"
+    echo "$B_TIME" > "$STATUS_DIR/time_${VARIANT}"
 
-    if [ "$VARIANT" == "KSU" ]; then
-        TIME_KSU="$BUILD_TIME"
-        STATUS_KSU="✅ Finished (${BUILD_TIME})"
-    else
-        TIME_NONKSU="$BUILD_TIME"
-        STATUS_NONKSU="✅ Finished (${BUILD_TIME})"
-    fi
+    # Packing AnyKernel3
+    echo "packing" > "$STATUS_DIR/state_${VARIANT}"
+    rm -rf "$ANYKERNEL_VAR"
+    git clone -q -b ${DEVICE} https://github.com/rahmatsobrian/AnyKernel3.git "$ANYKERNEL_VAR" >> "$LOG_FILE" 2>&1
 
-    update_status "$(render_progress_message)"
-
-    # --- PACKING ---
-    ZIP_NAME="${KERNEL_NAME}-${VARIANT}-${DEVICE}-${KERNEL_VERSION}-${DATE_TITLE}-${TIME_TITLE}.zip"
-    clone_anykernel
-    cd "$ANYKERNEL_DIR" || exit 1
+    cd "$ANYKERNEL_VAR" || { echo "failed" > "$STATUS_DIR/state_${VARIANT}"; return 1; }
     rm -f Image* *.zip
+
+    local KIMG_DTB="$OUTDIR_VAR/arch/arm64/boot/Image.gz-dtb"
+    local KIMG="$OUTDIR_VAR/arch/arm64/boot/Image.gz"
+    local ZIP_NAME="${KERNEL_NAME}-${VARIANT}-${DEVICE}-${KERNEL_VERSION}-${DATE_TITLE}-${TIME_TITLE}.zip"
 
     if [ -f "$KIMG_DTB" ]; then
         cp "$KIMG_DTB" Image.gz-dtb
     elif [ -f "$KIMG" ]; then
         cp "$KIMG" Image.gz
     else
-        send_telegram_error "$VARIANT"
-        exit 1
+        cd "$ROOTDIR"
+        echo "failed" > "$STATUS_DIR/state_${VARIANT}"
+        return 1
     fi
 
-    zip -r9 "$ZIP_NAME" . -x ".git*" "README.md"
-    ZIP_PATH="$ANYKERNEL_DIR/$ZIP_NAME"
-    cd "$ROOTDIR" || exit 1
+    zip -r9 "$ZIP_NAME" . -x ".git*" "README.md" >> "$LOG_FILE" 2>&1
+    local ZIP_PATH="$ANYKERNEL_VAR/$ZIP_NAME"
+    cd "$ROOTDIR"
 
-    # --- UPLOADING ---
-    echo -e "$yellow[+] Uploading ${VARIANT} to Pixeldrain...$white"
-    PD_RESPONSE=$(curl -s -T "${ZIP_PATH}" -u :${PIXELDRAIN_API_KEY} "https://pixeldrain.com/api/file/${ZIP_NAME}")
-    PD_ID=$(echo "$PD_RESPONSE" | jq -r '.id // empty')
-    
+    # Upload Pixeldrain
+    echo "uploading" > "$STATUS_DIR/state_${VARIANT}"
+    local PD_RESPONSE=$(curl -s -T "${ZIP_PATH}" -u :${PIXELDRAIN_API_KEY} "https://pixeldrain.com/api/file/${ZIP_NAME}")
+    local PD_ID=$(echo "$PD_RESPONSE" | jq -r '.id // empty')
+    local PD_LINK="Upload Failed"
     if [ -n "$PD_ID" ] && [ "$PD_ID" != "null" ]; then
         PD_LINK="https://pixeldrain.com/u/${PD_ID}"
-    else
-        PD_LINK="Upload Failed"
     fi
 
-    # Generate Safelinku
-    SL_LINK=$(python3 << EOF
+    # Safelinku via Telethon (dikunci dengan flock agar tidak bentrok)
+    local SL_LINK="Generation Failed"
+    (
+        flock -x 200
+        SL_LINK=$(python3 << EOF
 import asyncio, os, re, logging
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -292,33 +242,99 @@ async def main():
 asyncio.run(main())
 EOF
 )
+    ) 200>/tmp/telethon.lock
 
-    if [ "$VARIANT" == "KSU" ]; then
-        DL_TEXT_KSU="🔗 [Direct](${PD_LINK}) | 💰 [Safelinku](${SL_LINK})"
+    if [ "$SL_LINK" != "Generation Failed" ] && [[ "$SL_LINK" == http* ]]; then
+        echo "🔗 [Direct](${PD_LINK}) | 💰 [Safelinku](${SL_LINK})" > "$STATUS_DIR/link_${VARIANT}"
     else
-        DL_TEXT_NONKSU="🔗 [Direct](${PD_LINK}) | 💰 [Safelinku](${SL_LINK})"
+        echo "🔗 [Direct](${PD_LINK}) | ⚠️ Safelinku Failed" > "$STATUS_DIR/link_${VARIANT}"
     fi
 
-    # Kirim file zip lampiran
+    # Kirim dokumen zip ke Telegram
     curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
         -F chat_id="${TG_CHAT_ID}" \
         -F document=@"${ZIP_PATH}" \
         -F caption="📦 ${ZIP_NAME}" > /dev/null
+
+    echo "finished" > "$STATUS_DIR/state_${VARIANT}"
 }
 
-# ================= MAIN EXECUTION =================
+# ================= EXECUTION =================
 get_kernel_version
 get_ksu_version
 send_telegram_start
 
-# 1. Build KSU
-build_single_variant "KSU"
+START_TIME=$(TZ=Asia/Jakarta date +%s)
+echo "$START_TIME" > "$STATUS_DIR/start_KSU"
+echo "$START_TIME" > "$STATUS_DIR/start_NonKSU"
 
-# 2. Build NonKSU
-build_single_variant "NonKSU"
+# Jalankan 2 build secara PARALEL (di background)
+build_single_variant "KSU" &
+PID_KSU=$!
 
-# 3. Final Summary Update (Ke 1 pesan yang sama)
-update_status "🔥 *Kernel CI Build Success*
+build_single_variant "NonKSU" &
+PID_NONKSU=$!
+
+# Monitor & Update 1 Pesan Telegram secara Real-time
+while kill -0 $PID_KSU 2>/dev/null || kill -0 $PID_NONKSU 2>/dev/null; do
+    sleep 10
+    NOW=$(TZ=Asia/Jakarta date +%s)
+
+    # Status KSU
+    ST_KSU=$(cat "$STATUS_DIR/state_KSU" 2>/dev/null)
+    if [ "$ST_KSU" == "compiling" ]; then
+        DIFF_KSU=$((NOW - START_TIME))
+        TXT_KSU="🛠️ Compiling... (⏱️ $((DIFF_KSU / 60))m $((DIFF_KSU % 60))s)"
+    elif [ "$ST_KSU" == "packing" ]; then
+        TXT_KSU="📦 Packing AnyKernel3..."
+    elif [ "$ST_KSU" == "uploading" ]; then
+        TXT_KSU="☁️ Uploading..."
+    elif [ "$ST_KSU" == "finished" ]; then
+        TXT_KSU="✅ Finished ($(cat "$STATUS_DIR/time_KSU" 2>/dev/null))"
+    elif [ "$ST_KSU" == "failed" ]; then
+        TXT_KSU="❌ Failed"
+    else
+        TXT_KSU="⏳ Pending..."
+    fi
+
+    # Status NonKSU
+    ST_NONKSU=$(cat "$STATUS_DIR/state_NonKSU" 2>/dev/null)
+    if [ "$ST_NONKSU" == "compiling" ]; then
+        DIFF_NONKSU=$((NOW - START_TIME))
+        TXT_NONKSU="🛠️ Compiling... (⏱️ $((DIFF_NONKSU / 60))m $((DIFF_NONKSU % 60))s)"
+    elif [ "$ST_NONKSU" == "packing" ]; then
+        TXT_NONKSU="📦 Packing AnyKernel3..."
+    elif [ "$ST_NONKSU" == "uploading" ]; then
+        TXT_NONKSU="☁️ Uploading..."
+    elif [ "$ST_NONKSU" == "finished" ]; then
+        TXT_NONKSU="✅ Finished ($(cat "$STATUS_DIR/time_NonKSU" 2>/dev/null))"
+    elif [ "$ST_NONKSU" == "failed" ]; then
+        TXT_NONKSU="❌ Failed"
+    else
+        TXT_NONKSU="⏳ Pending..."
+    fi
+
+    update_status "🛠️ *Building Yoru Kernel (Parallel)*
+
+📱 *Device* : ${DEVICE}
+⚙️ *Compiler* : ZyC Clang
+
+🦸 *KSU Variant* (${KSU_VERSION})
+Status : ${TXT_KSU}
+
+🍃 *NonKSU Variant*
+Status : ${TXT_NONKSU}"
+done
+
+wait $PID_KSU
+wait $PID_NONKSU
+
+# Hasil Akhir
+ST_KSU=$(cat "$STATUS_DIR/state_KSU" 2>/dev/null)
+ST_NONKSU=$(cat "$STATUS_DIR/state_NonKSU" 2>/dev/null)
+
+if [ "$ST_KSU" == "finished" ] && [ "$ST_NONKSU" == "finished" ]; then
+    update_status "🔥 *Kernel CI Build Success*
 
 📱 *Device* : ${DEVICE}
 📦 *Kernel Name* : ${KERNEL_NAME}
@@ -326,11 +342,27 @@ update_status "🔥 *Kernel CI Build Success*
 🕒 *Build Date* : ${BUILD_DATETIME}
 
 🦸 *KSU Variant* (${KSU_VERSION})
-⌛ Build Time : ${TIME_KSU}
-📥 Links : ${DL_TEXT_KSU}
+⌛ Build Time : $(cat "$STATUS_DIR/time_KSU")
+📥 Links : $(cat "$STATUS_DIR/link_KSU")
 
 🍃 *NonKSU Variant*
-⌛ Build Time : ${TIME_NONKSU}
-📥 Links : ${DL_TEXT_NONKSU}"
+⌛ Build Time : $(cat "$STATUS_DIR/time_NonKSU")
+📥 Links : $(cat "$STATUS_DIR/link_NonKSU")"
 
-echo -e "$green[✓] All builds completed successfully!$white"
+    send_telegram_log "KSU"
+    send_telegram_log "NonKSU"
+    echo -e "$green[✓] Parallel builds completed successfully!$white"
+else
+    update_status "❌ *Kernel CI Build Failed*
+
+📱 *Device* : ${DEVICE}
+📦 *Kernel Name* : ${KERNEL_NAME}
+🦸 *KSU Status* : ${ST_KSU}
+🍃 *NonKSU Status* : ${ST_NONKSU}
+
+📄 *Log files attached below*"
+
+    [ "$ST_KSU" == "failed" ] && send_telegram_log "KSU"
+    [ "$ST_NONKSU" == "failed" ] && send_telegram_log "NonKSU"
+    exit 1
+fi
