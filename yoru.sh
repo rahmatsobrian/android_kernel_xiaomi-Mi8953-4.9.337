@@ -23,13 +23,10 @@ DEFCONFIG="msm8953-perf_defconfig"
 FRAGMENT="mi8953.config"
 TEMP_DEFCONFIG="msm8953-perf_temp_defconfig"
 ROOTDIR=$(pwd)
-OUTDIR="$ROOTDIR/out/arch/arm64/boot"
 ANYKERNEL_DIR="$ROOTDIR/AnyKernel"
 LOG_DIR="$ROOTDIR/logs"
 ZIPS_DIR="$ROOTDIR/zips"
 IMAGES_DIR="$ROOTDIR/images"
-KIMG_DTB="$OUTDIR/Image.gz-dtb"
-KIMG="$OUTDIR/Image.gz"
 
 # ========== TOOLCHAIN (CLANG) ===========
 export PATH="$ROOTDIR/clang-zyc/bin:$PATH"
@@ -62,6 +59,7 @@ OBJ_REGEX='^[[:space:]]+(CC|AS|HOSTCC)[[:space:]]'
 # ================= GLOBAL =================
 BUILD_TIME="unknown"
 KERNEL_VERSION="unknown"
+KSU_VERSION="unknown"
 IMG_USED="unknown"
 ZIP_NAME=""
 VARIANT=""
@@ -95,6 +93,15 @@ make_bar() {
 }
 
 # ================= FUNCTION =================
+# Tiap varian punya folder out & temp defconfig sendiri supaya bisa build paralel
+set_variant_env() {
+    OUT_REL="out-${VARIANT}"
+    OUTDIR="$ROOTDIR/$OUT_REL/arch/arm64/boot"
+    KIMG_DTB="$OUTDIR/Image.gz-dtb"
+    KIMG="$OUTDIR/Image.gz"
+    TEMP_DEFCONFIG_V="msm8953-perf_temp_${VARIANT}_defconfig"
+}
+
 clone_anykernel() {
     if [ ! -d "$ANYKERNEL_DIR" ]; then
         echo -e "$yellow[+] Cloning AnyKernel3...$white"
@@ -113,6 +120,18 @@ get_kernel_version() {
     fi
 }
 
+get_ksu_version() {
+    # setup.sh membuat symlink drivers/kernelsu -> KernelSU/kernel
+    local mk=""
+    for f in "$ROOTDIR/drivers/kernelsu/Makefile" "$ROOTDIR/KernelSU/kernel/Makefile"; do
+        if [ -f "$f" ]; then mk="$f"; break; fi
+    done
+    if [ -n "$mk" ]; then
+        KSU_VERSION=$(grep -oE 'KSU_VERSION=[0-9]+' "$mk" | head -n 1 | cut -d= -f2)
+    fi
+    [ -z "$KSU_VERSION" ] && KSU_VERSION="unknown"
+}
+
 # ================= TELEGRAM (1 PESAN, DI-EDIT REALTIME) =================
 render_variant() {
     local V=$1 now=$2
@@ -125,12 +144,13 @@ render_variant() {
         waiting)
             printf '⏳ <b>%s</b> — Waiting' "$V"
             ;;
-        config|building|packing|uploading)
+        config|building|packing|queue|uploading)
             el=$((now - start))
             case "$status" in
                 config)    label="⚙️ Configuring" ;;
                 building)  label="🔨 Compiling" ;;
                 packing)   label="📦 Packing" ;;
+                queue)     label="⏳ Waiting upload slot" ;;
                 uploading) label="☁️ Uploading" ;;
             esac
             if [ "$status" = "building" ]; then
@@ -190,6 +210,9 @@ render_msg() {
     out="${title}${NL}${NL}"
     out+="📱 <b>Device</b> : ${DEVICE}${NL}"
     out+="🍃 <b>Kernel</b> : ${KERNEL_NAME} ${KERNEL_VERSION}${NL}"
+    if [ "$KSU_VERSION" != "unknown" ] && [[ " ${VARIANTS[*]} " == *" KSU "* ]]; then
+        out+="🛡️ <b>KernelSU</b> : ${KSU_VERSION}${NL}"
+    fi
     out+="🕒 <b>Date</b> : ${BUILD_DATETIME}${NL}${NL}"
 
     for V in "${VARIANTS[@]}"; do
@@ -282,29 +305,29 @@ build_kernel() {
     st_set "$VARIANT.start" "$(date +%s)"
     st_set "$VARIANT.status" config
 
-    echo -e "$yellow[+] Removing out folder...$white"
-    rm -rf out
+    echo -e "$yellow[+] Removing ${OUT_REL} folder...$white"
+    rm -rf "$OUT_REL"
 
-    echo -e "$yellow[+] Creating out folder...$white"
-    mkdir -p out
+    echo -e "$yellow[+] Creating ${OUT_REL} folder...$white"
+    mkdir -p "$OUT_REL"
 
     # === DYNAMIC DEFCONFIG SETUP ===
     echo -e "$yellow[+] Preparing kernel config for ${VARIANT}...$white"
-    cp arch/arm64/configs/${DEFCONFIG} arch/arm64/configs/${TEMP_DEFCONFIG}
+    cp arch/arm64/configs/${DEFCONFIG} arch/arm64/configs/${TEMP_DEFCONFIG_V}
 
     if [ "$VARIANT" == "NonKSU" ]; then
         echo -e "$yellow[+] Stripping KSU configs for Non-KSU build...$white"
-        sed -i 's/CONFIG_KSU=y/# CONFIG_KSU is not set/g' arch/arm64/configs/${TEMP_DEFCONFIG}
+        sed -i 's/CONFIG_KSU=y/# CONFIG_KSU is not set/g' arch/arm64/configs/${TEMP_DEFCONFIG_V}
     fi
 
     # Setting config
     echo -e "$yellow[+] Preparing kernel config...$white"
-    run_logged make O=out ARCH=arm64 ${TEMP_DEFCONFIG} ${FRAGMENT} || {
-        rm -f arch/arm64/configs/${TEMP_DEFCONFIG}
+    run_logged make O="$OUT_REL" ARCH=arm64 ${TEMP_DEFCONFIG_V} ${FRAGMENT} || {
+        rm -f arch/arm64/configs/${TEMP_DEFCONFIG_V}
         fail_variant
         return 1
     }
-    rm -f arch/arm64/configs/${TEMP_DEFCONFIG}
+    rm -f arch/arm64/configs/${TEMP_DEFCONFIG_V}
 
     BUILD_START=$(TZ=Asia/Jakarta date +%s)
     st_set "$VARIANT.status" building
@@ -312,7 +335,7 @@ build_kernel() {
     echo -e "$yellow[+] Building Kernel [${VARIANT}]...$white"
     run_logged make -j$(nproc --all) \
         ARCH=arm64 \
-        O=out \
+        O="$OUT_REL" \
         CC=clang \
         CROSS_COMPILE=aarch64-linux-gnu- \
         CROSS_COMPILE_ARM32=arm-linux-gnueabi- || {
@@ -346,8 +369,10 @@ pack_kernel() {
     st_set "$VARIANT.status" packing
     echo -e "$yellow[+] Packing AnyKernel...$white"
 
-    clone_anykernel
-    cd "$ANYKERNEL_DIR" || exit 1
+    PACK_DIR="$ROOTDIR/AnyKernel-${VARIANT}"
+    rm -rf "$PACK_DIR"
+    cp -r "$ANYKERNEL_DIR" "$PACK_DIR"
+    cd "$PACK_DIR" || return 1
 
     rm -f Image* *.zip
 
@@ -476,32 +501,63 @@ EOF
 }
 
 # ================= RUN =================
+run_variant() {
+    VARIANT="$1"
+    LOG="$LOG_DIR/build-${VARIANT}.txt"
+    : > "$LOG"
+    set_variant_env
+    trap - EXIT
+
+    echo -e "$yellow========== Variant: ${VARIANT} ==========$white"
+
+    if build_kernel && pack_kernel; then
+        st_set "$VARIANT.status" queue
+        # Upload + Safelinku dibuat antre (1 per 1): sesi Telethon yang sama tidak boleh
+        # dipakai 2 koneksi sekaligus, dan balasan bot bisa tertukar antar varian.
+        ( flock 9; upload_variant ) 9> "$STATE_DIR/upload.lock"
+        st_set "$VARIANT.end" "$(date +%s)"
+        st_set "$VARIANT.status" "done"
+        return 0
+    fi
+
+    if [ "$(st_get "$VARIANT.status" "")" != "failed" ]; then
+        fail_variant
+    fi
+    return 1
+}
+
 mkdir -p "$LOG_DIR" "$ZIPS_DIR" "$IMAGES_DIR"
 trap 'touch "$STATE_DIR/stop"' EXIT
 
 get_kernel_version
+get_ksu_version
+echo -e "$yellow[+] Kernel ${KERNEL_VERSION} | KernelSU ${KSU_VERSION}$white"
 st_set total "$EST_OBJECTS"
 for V in "${VARIANTS[@]}"; do
     st_set "$V.status" waiting
 done
+
+clone_anykernel
 
 echo -e "$yellow[+] Sending telegram start...$white"
 tg_start
 tg_updater &
 UPDATER_PID=$!
 
+PIDS=()
+for V in "${VARIANTS[@]}"; do
+    # Tiap varian jalan di subshell sendiri, bersamaan. Output console diberi prefix [Varian]
+    ( run_variant "$V"; st_set "$V.rc" "$?" ) 2>&1 | sed -u "s/^/[${V}] /" &
+    PIDS+=($!)
+done
+
+for pid in "${PIDS[@]}"; do
+    wait "$pid"
+done
+
 FAILED=0
 for V in "${VARIANTS[@]}"; do
-    VARIANT="$V"
-    LOG="$LOG_DIR/build-${VARIANT}.txt"
-    : > "$LOG"
-
-    echo -e "$yellow========== Variant: ${VARIANT} ==========$white"
-
-    if build_kernel && pack_kernel && upload_variant; then
-        st_set "$VARIANT.end" "$(date +%s)"
-        st_set "$VARIANT.status" "done"
-    else
+    if [ "$(st_get "$V.rc" 1)" != "0" ]; then
         FAILED=$((FAILED + 1))
     fi
 done
