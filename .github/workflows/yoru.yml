@@ -30,7 +30,7 @@ jobs:
             llvm lld lldb clang gcc binutils bison perl gperf gawk flex bc python3 python3-pip zstd \
             openssl unzip cpio build-essential ccache liblz4-tool libsdl1.2-dev libstdc++6 \
             libxml2 libxml2-utils lzop pngcrush schedtool squashfs-tools xsltproc zlib1g-dev \
-            libncurses5-dev bzip2 gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            libncurses5-dev bzip2 gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
             gcc-arm-linux-gnueabi dos2unix kmod
           
           # Install Telethon untuk Userbot
@@ -46,9 +46,15 @@ jobs:
 
       - name: Setup KernelSU (Hookless)
         run: |
+          # curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+          # curl -LSs "https://raw.githubusercontent.com/Mr-Morat/KernelSU-Next/stable/kernel/setup.sh" | bash -s syscall
           curl -LSs "https://raw.githubusercontent.com/backslashxx/KernelSU/master/kernel/setup.sh" | bash -
 
-      - name: Start Build with log
+      # - name: Patch Kernel With Manual Hook
+        # run: |
+          # patch -p1 < 0001-ksu-manual-hooks-k49-final.patch
+
+      - name: Start Build (KSU + NonKSU)
         env:
           KBUILD_BUILD_USER: "Hoshino"
           KBUILD_BUILD_HOST: "Yoru"
@@ -68,10 +74,20 @@ jobs:
         with:
           name: build-logs
           path: logs/
+          if-no-files-found: ignore
 
       - name: Upload AnyKernel Zips
-        if: success()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: anykernel-zips
-          path: AnyKernel/*.zip
+          path: zips/*.zip
+          if-no-files-found: ignore
+
+      - name: Upload Kernel Images (Image.gz & Image.gz-dtb)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-images
+          path: images/
+          if-no-files-found: ignore
